@@ -2,8 +2,8 @@ name: Update DTEK Schedule (Node.js)
 
 on:
   schedule:
-    - cron: '*/15 * * * *' # Запуск кожні 15 хвилин
-  workflow_dispatch:       # Кнопка для ручного запуску
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
 
 jobs:
   update:
@@ -27,7 +27,4 @@ jobs:
         env:
           CF_WORKER_URL: ${{ secrets.CF_WORKER_URL }}
           CF_SECRET_TOKEN: ${{ secrets.CF_SECRET_TOKEN }}
-          CITY: ${{ secrets.CITY }}
-          STREET: ${{ secrets.STREET }}
-          HOUSE: ${{ secrets.HOUSE }}
         run: node sync.js
