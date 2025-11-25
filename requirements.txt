@@ -1,1 +1,2 @@
-requestsdtek-monitor
+requests
+dtek-monitor
