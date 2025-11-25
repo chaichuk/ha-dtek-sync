@@ -4,16 +4,18 @@ import { fetch } from 'undici';
 const { CF_WORKER_URL, CF_SECRET_TOKEN } = process.env;
 const SHUTDOWNS_PAGE = "https://www.dtek-krem.com.ua/ua/shutdowns";
 
-// Мапа статусів з коду сайту ДТЕК -> Наші коди (0=Є, 1=Можливо, 2=Немає)
-// Формат: [перші 30 хв, другі 30 хв]
+// Мапа статусів: [перші 30 хв, другі 30 хв]
+// 0 = Світло є (Білий)
+// 1 = Можливо немає (Сірий)
+// 2 = Немає (Чорний)
 const STATUS_MAP = {
-    "yes": [0, 0],      // Світло є
-    "no": [2, 2],       // Світла немає
-    "maybe": [1, 1],    // Можливе відключення (сіре)
-    "first": [2, 0],    // Немає перші 30 хв (наприклад 14:00-14:30)
-    "second": [0, 2],   // Немає другі 30 хв (14:30-15:00)
-    "mfirst": [1, 0],   // Можливо немає перші 30 хв
-    "msecond": [0, 1]   // Можливо немає другі 30 хв
+    "yes": [0, 0],      
+    "no": [2, 2],       
+    "maybe": [1, 1],    
+    "first": [2, 0],    // Немає перші 30 хв
+    "second": [0, 2],   // Немає другі 30 хв
+    "mfirst": [1, 0],   
+    "msecond": [0, 1]   
 };
 
 async function run() {
@@ -22,97 +24,92 @@ async function run() {
         process.exit(1);
     }
 
-    console.log('🚀 Запуск глобального парсера (режим Stealth)...');
-    
-    // Запускаємо браузер з налаштуваннями, щоб сховатися від бот-фільтрів
+    console.log('🚀 Запуск...');
     const browser = await chromium.launch({ 
         headless: true,
-        args: [
-            '--disable-blink-features=AutomationControlled', // Приховує, що це автоматизація
-            '--no-sandbox',
-            '--disable-setuid-sandbox'
-        ]
+        args: ['--no-sandbox', '--disable-setuid-sandbox'] 
     });
     
-    // Створюємо контекст з реалістичним User-Agent
-    const context = await browser.newContext({
-        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    });
-
     try {
-        const page = await context.newPage();
+        const page = await browser.newPage();
         
-        // Додаємо скрипт, щоб приховати webdriver (ще один рівень захисту)
-        await page.addInitScript(() => {
-            Object.defineProperty(navigator, 'webdriver', {
-                get: () => undefined,
-            });
-        });
-
-        console.log('🌍 Відкриваю сайт ДТЕК...');
-        // Збільшуємо тайм-аут до 60 секунд на випадок перевірки Cloudflare
+        console.log('🌍 Відкриваю сайт...');
+        // Чекаємо завантаження контенту (HTML)
         await page.goto(SHUTDOWNS_PAGE, { waitUntil: "domcontentloaded", timeout: 60000 });
 
-        console.log('⏳ Чекаю проходження перевірки Cloudflare та завантаження даних...');
-        // Чекаємо трохи, щоб Cloudflare встиг подумати, а сайт - ініціалізувати змінні
-        await page.waitForTimeout(10000); 
+        // Отримуємо повний HTML сторінки
+        const content = await page.content();
+        
+        // --- ЛОГІКА ПАРСИНГУ HTML (REGEX) ---
+        console.log('🔍 Шукаю дані в коді сторінки...');
+        
+        // Шукаємо рядок: DisconSchedule.fact = { ... }
+        // Регулярка захоплює все від початку об'єкта до його кінця (приблизно)
+        const regex = /DisconSchedule\.fact\s*=\s*(\{[\s\S]*?\})\n/m;
+        const match = content.match(regex);
 
-        // Спробуємо знайти дані кілька разів
-        let dtekData = null;
-        for (let i = 0; i < 5; i++) {
-            dtekData = await page.evaluate(() => {
-                // Тут ми ліземо прямо в "мозок" сайту і забираємо готову таблицю
-                if (typeof window.DisconSchedule === 'undefined' || !window.DisconSchedule.fact) {
-                    return null;
-                }
-                return window.DisconSchedule.fact.data;
-            });
+        let rawData = null;
 
-            if (dtekData) break;
-            console.log(`...спроба ${i + 1}: змінна DisconSchedule ще не завантажилась, чекаю...`);
-            await page.waitForTimeout(3000);
+        if (match && match[1]) {
+            try {
+                // Спробуємо розпарсити знайдений текст як JSON
+                // Оскільки це JS об'єкт, ключі можуть бути без лапок, але в вашому файлі вони в лапках,
+                // тому JSON.parse має спрацювати, якщо структура чиста.
+                // Якщо ні - використаємо eval (безпечно в цьому контексті, бо ми самі запускаємо скрипт)
+                const jsonStr = match[1];
+                
+                // Трюк: eval дозволяє прочитати JS-об'єкт, навіть якщо це не строгий JSON
+                rawData = eval(`(${jsonStr})`); 
+                
+                // Нам потрібне поле .data
+                rawData = rawData.data;
+                
+                console.log('✅ Дані успішно вирізано з HTML!');
+            } catch (e) {
+                console.error('❌ Помилка парсингу знайденого тексту:', e);
+            }
+        } else {
+            console.error('❌ Рядок DisconSchedule.fact не знайдено в HTML.');
         }
 
-        if (!dtekData) {
-            console.error('❌ Не вдалося знайти DisconSchedule.fact.data навіть після очікування.');
-            const title = await page.title();
-            console.log('Заголовок сторінки:', title);
-            // Можна зробити скріншот для дебагу, якщо треба
-            // await page.screenshot({ path: 'error.png' });
+        // Якщо Regex не спрацював, спробуємо старий метод (через window) як запасний
+        if (!rawData) {
+            console.log('⚠️ Спроба отримати дані через JS-змінну...');
+            rawData = await page.evaluate(() => {
+                return window.DisconSchedule?.fact?.data || null;
+            });
+        }
+
+        if (!rawData) {
+            console.error('❌ ДАНІ НЕ ЗНАЙДЕНО ЖОДНИМ МЕТОДОМ.');
             process.exit(1);
         }
 
-        console.log('✅ Глобальні дані отримано! Починаю обробку...');
-        
+        // --- ОБРОБКА ДАНИХ ---
+        console.log('⚙️ Обробка графіків...');
         const formattedSchedule = {};
-        
-        // Отримуємо дати (ключі - це timestamp, наприклад "1764108000")
-        const timestamps = Object.keys(dtekData).sort();
-        
-        let dateToday = "";
-        let dateTomorrow = "";
+        const timestamps = Object.keys(rawData).sort();
 
-        // Функція конвертації timestamp у YYYY-MM-DD
         const tsToDate = (ts) => {
-            // Timestamp у секундах, множимо на 1000
             const d = new Date(parseInt(ts) * 1000);
             return d.toLocaleDateString("en-CA", { timeZone: "Europe/Kyiv" });
         };
 
+        let dateToday = "";
+        let dateTomorrow = "";
+        
         if (timestamps.length > 0) dateToday = tsToDate(timestamps[0]);
         if (timestamps.length > 1) dateTomorrow = tsToDate(timestamps[1]);
-        
-        console.log(`📅 Знайдено дати: ${dateToday} та ${dateTomorrow}`);
 
-        // Парсинг даних
+        console.log(`📅 Дати: ${dateToday}, ${dateTomorrow}`);
+
         for (const ts of timestamps) {
             const dateStr = tsToDate(ts);
-            const dayData = dtekData[ts]; // Об'єкт з групами "GPV1.1", "GPV1.2" ...
+            const dayGroups = rawData[ts]; 
 
-            // Проходимо по групах (GPV1.1 ... GPV6.2)
-            for (const [groupKey, hoursData] of Object.entries(dayData)) {
-                // Перетворюємо "GPV1.1" -> "1.1"
-                const cleanGroup = groupKey.replace('GPV', '');
+            for (const [groupCode, hoursData] of Object.entries(dayGroups)) {
+                // "GPV1.1" -> "1.1"
+                const cleanGroup = groupCode.replace('GPV', '');
                 
                 if (!formattedSchedule[cleanGroup]) {
                     formattedSchedule[cleanGroup] = {};
@@ -121,16 +118,13 @@ async function run() {
                 const daySchedule = {};
 
                 // Проходимо по годинах (1..24)
-                // У вашому прикладі ключі годин це рядки "1", "2"... "24"
                 for (let h = 1; h <= 24; h++) {
-                    const statusKey = hoursData[h.toString()]; // "yes", "no", "maybe"...
-                    const codes = STATUS_MAP[statusKey] || [0, 0]; // Дефолт 0 (світло є)
+                    const statusKey = hoursData[h.toString()];
+                    const codes = STATUS_MAP[statusKey] || [0, 0];
 
-                    // Година в форматі 00..23
                     const hourIndex = h - 1; 
                     const hh = hourIndex.toString().padStart(2, '0');
 
-                    // Записуємо :00 та :30
                     daySchedule[`${hh}:00`] = codes[0];
                     daySchedule[`${hh}:30`] = codes[1];
                 }
@@ -139,13 +133,7 @@ async function run() {
             }
         }
 
-        // Перевірка, чи сформувалися дані
-        if (Object.keys(formattedSchedule).length === 0) {
-            console.error("❌ Помилка: JSON пустий після парсингу.");
-            process.exit(1);
-        }
-
-        // Формуємо фінальний пакет
+        // --- ВІДПРАВКА ---
         const finalJson = {
             date_today: dateToday,
             date_tomorrow: dateTomorrow,
@@ -160,9 +148,7 @@ async function run() {
             ]
         };
 
-        // console.log(JSON.stringify(finalJson, null, 2)); // Для дебагу
-
-        console.log('📤 Відправляю дані на Worker...');
+        console.log('📤 Відправка на Worker...');
         const response = await fetch(CF_WORKER_URL, {
             method: 'POST',
             headers: {
@@ -170,14 +156,13 @@ async function run() {
                 'Authorization': `Bearer ${CF_SECRET_TOKEN}`
             },
             body: JSON.stringify({
-                // Екрануємо внутрішній JSON, щоб зберегти сумісність з svitlo.live
-                body: JSON.stringify(finalJson), 
+                body: JSON.stringify(finalJson),
                 timestamp: Date.now()
             })
         });
 
         if (response.ok) {
-            console.log('✅ Успіх! Глобальний графік оновлено.');
+            console.log('✅ Успіх! Дані оновлено.');
         } else {
             console.error(`❌ Помилка Worker: ${response.status} ${await response.text()}`);
         }
