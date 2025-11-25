@@ -1,77 +1,83 @@
 import { chromium } from 'playwright';
 import { fetch } from 'undici';
 
-// Налаштування з Secrets
-const WORKER_URL = process.env.CF_WORKER_URL;
-const SECRET_TOKEN = process.env.CF_SECRET_TOKEN;
-const CITY = process.env.CITY;     // Наприклад: "Вишневе"
-const STREET = process.env.STREET; // Наприклад: "Лесі Українки"
-const HOUSE = process.env.HOUSE;   // Наприклад: "15"
+// 1. Налаштування (беруться з Secrets GitHub)
+const { 
+  CF_WORKER_URL, 
+  CF_SECRET_TOKEN, 
+  CITY, 
+  STREET, 
+  HOUSE 
+} = process.env;
+
+const SHUTDOWNS_PAGE = "https://www.dtek-krem.com.ua/ua/shutdowns";
 
 async function run() {
-  if (!WORKER_URL || !SECRET_TOKEN || !CITY || !STREET || !HOUSE) {
-    console.error('❌ Помилка: Не всі змінні оточення задані (CITY, STREET, HOUSE, CF_WORKER_URL, CF_SECRET_TOKEN)');
+  // Перевірка наявності всіх змінних
+  if (!CF_WORKER_URL || !CF_SECRET_TOKEN || !CITY || !STREET || !HOUSE) {
+    console.error('❌ Помилка: Відсутні необхідні Secrets. Перевірте налаштування репозиторію (CITY, STREET, HOUSE, CF_WORKER_URL, CF_SECRET_TOKEN)');
     process.exit(1);
   }
 
-  console.log('🚀 Запуск браузера...');
+  console.log(`🚀 Запуск моніторингу для: ${CITY}, ${STREET}, ${HOUSE}`);
   const browser = await chromium.launch({ headless: true });
-  const page = await browser.newPage();
-
+  
   try {
-    // 1. Відкриваємо сайт ДТЕК Київські Регіональні Електромережі
-    console.log('🌍 Відкриваю сайт ДТЕК...');
-    await page.goto('https://www.dtek-krem.com.ua/ua/shutdowns');
-
-    // 2. Заповнюємо форму
-    console.log(`📝 Вводжу адресу: ${CITY}, ${STREET}, ${HOUSE}`);
+    const page = await browser.newPage();
     
-    // Вводимо місто
-    await page.getByLabel('Населений пункт').fill(CITY);
-    // Чекаємо на випадаючий список і клікаємо перше співпадіння (або конкретне)
-    await page.waitForTimeout(1000); 
-    await page.keyboard.press('ArrowDown');
-    await page.keyboard.press('Enter');
+    // 2. Заходимо на сайт, щоб отримати токен безпеки (CSRF)
+    console.log('🌍 Відкриваю сторінку ДТЕК...');
+    await page.goto(SHUTDOWNS_PAGE, { waitUntil: "load" });
 
-    // Вводимо вулицю
-    await page.getByLabel('Вулиця').fill(STREET);
-    await page.waitForTimeout(1000);
-    await page.keyboard.press('ArrowDown');
-    await page.keyboard.press('Enter');
+    // Чекаємо на токен у коді сторінки
+    const csrfTokenTag = await page.waitForSelector('meta[name="csrf-token"]', { state: "attached" });
+    const csrfToken = await csrfTokenTag.getAttribute("content");
+    console.log('🔑 Токен безпеки отримано.');
 
-    // Вводимо будинок
-    await page.getByLabel('Будинок').fill(HOUSE);
-    await page.waitForTimeout(1000);
-    await page.keyboard.press('ArrowDown');
-    await page.keyboard.press('Enter');
+    // 3. Виконуємо "Хитрий запит" (як у оригінальному парсері)
+    // Ми виконуємо код прямо всередині сторінки браузера
+    console.log('📡 Отримую дані про відключення...');
+    const info = await page.evaluate(async ({ city, street, token }) => {
+        const formData = new URLSearchParams();
+        formData.append("method", "getHomeNum");
+        formData.append("data[0][name]", "city");
+        formData.append("data[0][value]", city);
+        formData.append("data[1][name]", "street");
+        formData.append("data[1][value]", street);
+        // Цей параметр вимагає сервер
+        formData.append("data[2][name]", "updateFact");
+        formData.append("data[2][value]", new Date().toLocaleString("uk-UA"));
 
-    // Натискаємо "Перевірити"
-    await page.getByRole('button', { name: 'Перевірити' }).click();
+        const response = await fetch("/ua/ajax", {
+          method: "POST",
+          headers: {
+            "x-requested-with": "XMLHttpRequest",
+            "x-csrf-token": token,
+            "content-type": "application/x-www-form-urlencoded; charset=UTF-8"
+          },
+          body: formData,
+        });
+        return await response.json();
+    }, { city: CITY, street: STREET, token: csrfToken });
 
-    // 3. Чекаємо на результат
-    console.log('⏳ Чекаю на графік...');
-    // Чекаємо появи контейнера з графіком (клас може змінюватися, шукаємо по тексту або структурі)
-    // Зазвичай там з'являється таблиця або повідомлення
-    await page.waitForSelector('.disconnection-schedule', { timeout: 10000 }).catch(() => console.log("⚠️ Специфічний селектор не знайдено, шукаємо далі..."));
+    // 4. Обробка результатів
+    // info.data - це об'єкт, де ключі - номери будинків
+    const houseData = info?.data?.[HOUSE];
 
-    // --- ТУТ ПОТРІБНА ЛОГІКА ПАРСИНГУ САМЕ ЦЬОГО САЙТУ ---
-    // Оскільки сайт динамічний, ми спробуємо знайти групу або дані графіку.
-    // Для спрощення ми зараз зробимо емуляцію:
-    // Якщо парсинг складний, ми можемо просто взяти ГРУПУ, якщо вона відображається,
-    // і згенерувати JSON на основі статичного розкладу (якщо він фіксований) 
-    // АБО спробувати витягнути години.
+    if (!houseData) {
+        console.log('⚠️ Даних по вашому будинку в відповіді не знайдено. Можливо, помилка в назві вулиці або будинку.');
+        console.log('Доступні будинки на цій вулиці:', Object.keys(info?.data || {}).join(', '));
+        // Не виходимо, відправимо "пустий" графік (світло є), щоб не ламати інтеграцію
+    }
+
+    // Готуємо графік (0 - світло є, 1 - можливо, 2 - немає)
+    // За замовчуванням заповнюємо "світло є"
+    const todayStr = new Date().toLocaleDateString("en-CA", { timeZone: "Europe/Kyiv" }); // YYYY-MM-DD
     
-    // Припустимо, ми знайшли, що зараз світла немає (status = 2)
-    // У рамках цього прикладу я створюю "болванку" JSON, яку ви очікуєте.
-    // **ВАЖЛИВО**: Щоб парсити реальні години з dtek-krem, треба бачити HTML сторінки результатів.
-    // Але давайте сформуємо структуру, щоб все працювало технічно.
-    
-    const todayStr = new Date().toISOString().split('T')[0];
     const tomorrow = new Date();
     tomorrow.setDate(tomorrow.getDate() + 1);
-    const tomorrowStr = tomorrow.toISOString().split('T')[0];
+    const tomorrowStr = tomorrow.toLocaleDateString("en-CA", { timeZone: "Europe/Kyiv" });
 
-    // Генеруємо пустий графік (0 - світло є)
     const generateEmptyDay = () => {
         const day = {};
         for (let i = 0; i < 24; i++) {
@@ -82,18 +88,57 @@ async function run() {
         return day;
     };
 
-    const schedule = {};
-    // Заповнюємо для груп 1-6
-    for (let i = 1; i <= 6; i++) {
-        schedule[`${i}.1`] = { [todayStr]: generateEmptyDay(), [tomorrowStr]: generateEmptyDay() };
-        schedule[`${i}.2`] = { [todayStr]: generateEmptyDay(), [tomorrowStr]: generateEmptyDay() };
+    const scheduleMap = {
+        [todayStr]: generateEmptyDay(),
+        [tomorrowStr]: generateEmptyDay()
+    };
+
+    // Якщо є відключення, заповнюємо графік
+    if (houseData && (houseData.sub_type || houseData.type)) {
+        console.log(`🚨 ЗНАЙДЕНО ВІДКЛЮЧЕННЯ: ${houseData.start_date} - ${houseData.end_date} (${houseData.sub_type})`);
+        
+        // Функція для парсингу дати з рядка ДТЕК (DD.MM.YYYY HH:mm)
+        const parseDtekDate = (dateStr) => {
+            if (!dateStr) return null;
+            const [datePart, timePart] = dateStr.split(' ');
+            const [d, m, y] = datePart.split('.');
+            const [h, min] = timePart.split(':');
+            return new Date(`${y}-${m}-${d}T${h}:${min}:00`);
+        };
+
+        const start = parseDtekDate(houseData.start_date);
+        const end = parseDtekDate(houseData.end_date);
+
+        if (start && end) {
+            let current = new Date(start);
+            // Округлюємо до найближчих 30 хв вниз
+            current.setSeconds(0, 0);
+            if (current.getMinutes() > 0 && current.getMinutes() < 30) current.setMinutes(0);
+            if (current.getMinutes() > 30) current.setMinutes(30);
+
+            while (current < end) {
+                const dStr = current.toLocaleDateString("en-CA", { timeZone: "Europe/Kyiv" });
+                const hStr = current.toLocaleTimeString("en-GB", { timeZone: "Europe/Kyiv", hour: '2-digit', minute: '2-digit' });
+                
+                if (scheduleMap[dStr] && scheduleMap[dStr][hStr] !== undefined) {
+                    // Ставимо 2 (відключення)
+                    scheduleMap[dStr][hStr] = 2; 
+                }
+                current.setMinutes(current.getMinutes() + 30);
+            }
+        }
+    } else {
+        console.log('⚡️ Активних відключень за вашою адресою не знайдено.');
     }
 
-    // Тут ви можете додати реальну логіку, якщо сайт показує "Група 1: відключення з 14:00 до 18:00"
-    // const groupText = await page.locator('.some-group-class').innerText();
-    // ... parse groupText ...
+    // 5. Формуємо JSON для Cloudflare
+    // Заповнюємо цим графіком ВСІ групи, щоб в Home Assistant завжди показувало правду
+    const schedule = {};
+    for (let i = 1; i <= 6; i++) {
+        schedule[`${i}.1`] = scheduleMap;
+        schedule[`${i}.2`] = scheduleMap;
+    }
 
-    // Формуємо фінальний об'єкт
     const finalJson = {
         date_today: todayStr,
         date_tomorrow: tomorrowStr,
@@ -102,8 +147,8 @@ async function run() {
                 cpu: "kiivska-oblast",
                 name_ua: "Київська",
                 name_ru: "Киевская",
-                name_en": "Kyiv",
-                schedule: schedule
+                name_en: "Kyiv",
+                schedule: schedule 
             }
         ]
     };
@@ -113,68 +158,29 @@ async function run() {
         timestamp: Date.now()
     };
 
-    console.log('📤 Відправляю дані на Worker...');
-    
-    const response = await fetch(WORKER_URL, {
+    // 6. Відправка на Worker
+    console.log('📤 Відправляю дані на Cloudflare Worker...');
+    const response = await fetch(CF_WORKER_URL, {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
-            'Authorization': `Bearer ${SECRET_TOKEN}`
+            'Authorization': `Bearer ${CF_SECRET_TOKEN}`
         },
         body: JSON.stringify(payload)
     });
 
     if (response.ok) {
-        console.log('✅ Дані успішно оновлено!');
+        console.log('✅ Успіх! Дані оновлено.');
     } else {
-        console.error(`❌ Помилка оновлення: ${response.status} ${await response.text()}`);
+        console.error(`❌ Помилка відправки: ${response.status} ${await response.text()}`);
     }
 
-  } catch (e) {
-    console.error('❌ Помилка під час виконання:', e);
+  } catch (err) {
+    console.error('❌ Критична помилка:', err);
+    process.exit(1);
   } finally {
     await browser.close();
   }
 }
 
 run();
-```
-
-### Файл 3: `.github/workflows/update_schedule.yml`
-Це інструкція для GitHub, як запускати Node.js.
-
-**Створіть файл `.github/workflows/update_schedule.yml`:**
-```yaml
-name: Update DTEK Schedule (Node.js)
-
-on:
-  schedule:
-    - cron: '*/30 * * * *'
-  workflow_dispatch:
-
-jobs:
-  update:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v3
-        with:
-          node-version: 18
-
-      - name: Install dependencies
-        run: npm install
-
-      - name: Install Playwright Browsers
-        run: npx playwright install chromium --with-deps
-
-      - name: Run Sync Script
-        env:
-          CF_WORKER_URL: ${{ secrets.CF_WORKER_URL }}
-          CF_SECRET_TOKEN: ${{ secrets.CF_SECRET_TOKEN }}
-          CITY: ${{ secrets.CITY }}
-          STREET: ${{ secrets.STREET }}
-          HOUSE: ${{ secrets.HOUSE }}
-        run: node sync.js
