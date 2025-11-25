@@ -1,29 +1,33 @@
-name: Update DTEK Schedule
+name: Update DTEK Schedule (Node.js)
 
 on:
   schedule:
     - cron: '*/30 * * * *' # Запуск кожні 30 хвилин
-  workflow_dispatch:       # Кнопка ручного запуску
+  workflow_dispatch:       # Кнопка для ручного запуску
 
 jobs:
-  update-data:
+  update:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
         with:
-          python-version: '3.9'
+          node-version: 18
 
       - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+        run: npm install
 
-      - name: Run parser script
+      - name: Install Playwright Browsers
+        run: npx playwright install chromium --with-deps
+
+      - name: Run Sync Script
         env:
           CF_WORKER_URL: ${{ secrets.CF_WORKER_URL }}
           CF_SECRET_TOKEN: ${{ secrets.CF_SECRET_TOKEN }}
-        run: python dtek_sync.py
+          CITY: ${{ secrets.CITY }}
+          STREET: ${{ secrets.STREET }}
+          HOUSE: ${{ secrets.HOUSE }}
+        run: node sync.js
